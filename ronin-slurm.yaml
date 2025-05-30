@@ -1,0 +1,150 @@
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+---
+blueprint_name: ronin-slurm
+
+# your state files will be stored in this bucket
+terraform_backend_defaults:
+  type: gcs
+  configuration:
+    bucket: ikwak-stuff
+
+vars:
+  project_id: gpu-launchpad-playground ## Set GCP Project ID Here ##
+  deployment_name: ronin-slurm
+  region: australia-southeast1
+  zone: australia-southeast1-a
+  bucket_name: ronin-slurm-bucket
+  slurm_worker_machine_type: c3-standard-8
+  slurm_worker_static_node_count: 2
+  slurm_login_node_count: 1
+  slurm_login_controller_machine_type: c3-standard-8
+  slurm_instance_image:
+    family: slurm-gcp-6-9-hpc-rocky-linux-8
+    project: schedmd-slurm-public
+  instance_image_custom: false  # true if using custom image in lines above
+  bandwidth_tier: gvnic_enabled
+
+
+deployment_groups:
+- group: networkanddata
+  modules:
+  - id: network
+    source: modules/network/vpc
+
+  # required for filestore access
+  - id: private_service_access
+    source: community/modules/network/private-service-access
+    use: [network]
+
+  # https://github.com/GoogleCloudPlatform/cluster-toolkit/tree/main/modules/file-system/filestore
+  - id: appfs
+    source: modules/file-system/filestore
+    use: [network, private_service_access]
+    settings:
+      filestore_tier: BASIC_SSD
+      size_gb: 2560
+      local_mount: /software
+
+  - id: homefs
+    source: modules/file-system/filestore
+    use: [network, private_service_access]
+    settings:
+      filestore_tier: BASIC_SSD
+      size_gb: 2560
+      local_mount: /home
+
+  # https://github.com/GoogleCloudPlatform/cluster-toolkit/tree/main/community/modules/file-system/cloud-storage-bucket
+  - id: data-bucket
+    source: community/modules/file-system/cloud-storage-bucket
+    settings:
+      force_destroy: true # if set to false, terraform stops destroying all resources
+      enable_hierarchical_namespace: true
+      random_suffix: true
+      mount_options: defaults,_netdev,implicit_dirs,allow_other,dir_mode=0777,file_mode=766
+      local_mount: /data
+
+- group: software
+  modules:
+  # https://github.com/GoogleCloudPlatform/cluster-toolkit/tree/main/community/modules/scripts/spack-setup
+  #- id: spack-setup
+  #  source: community/modules/scripts/spack-setup
+  #  settings:
+  #    install_dir: /software/spack
+
+  # https://github.com/GoogleCloudPlatform/cluster-toolkit/tree/main/modules/scripts/startup-script
+  - id: custom-worker-startup-script
+    source: modules/scripts/startup-script
+    settings:
+      runners:
+      - type: shell # type: data creates a file with content, but does not execute. Useful for creating config files
+        destination: local-script.sh # name of the script doesn't matter as content is executed directly
+        content: |
+          #!/bin/bash
+          # install prometheus or do something else here
+          echo "hello world from `hostname`" >> /home/hello.txt
+          echo "hello world from `hostname`" >> /software/hello.txt
+          echo "hello world from `hostname`" >> /data/hello.txt
+
+- group: cluster
+  modules:
+  # https://github.com/GoogleCloudPlatform/cluster-toolkit/tree/main/community/modules/compute/schedmd-slurm-gcp-v6-nodeset
+  - id: static_nodeset
+    source: community/modules/compute/schedmd-slurm-gcp-v6-nodeset
+    use:
+    - network
+    - custom-worker-startup-script
+    settings:
+      node_count_static: $(vars.slurm_worker_static_node_count)
+      node_count_dynamic_max: 0 # this creates an autoscaling partition that allows nodes to be created (max ceiling) as needed for jobs
+      machine_type: $(vars.slurm_worker_machine_type)
+      instance_image: $(vars.slurm_instance_image)
+      allow_automatic_updates: false
+      disk_type: hyperdisk-balanced
+
+  - id: static_partition
+    source: community/modules/compute/schedmd-slurm-gcp-v6-partition
+    use: [static_nodeset]
+    settings:
+      partition_name: compute
+      exclusive: false
+      is_default: true
+
+  # https://github.com/GoogleCloudPlatform/cluster-toolkit/tree/main/community/modules/scheduler/schedmd-slurm-gcp-v6-login
+  - id: slurm_login
+    source: community/modules/scheduler/schedmd-slurm-gcp-v6-login
+    use: [network]
+    settings:
+      machine_type: $(vars.slurm_login_controller_machine_type)
+      enable_login_public_ips: true
+      num_instances: $(vars.slurm_login_node_count)
+      disk_type: hyperdisk-balanced
+
+  # https://github.com/GoogleCloudPlatform/cluster-toolkit/tree/main/community/modules/scheduler/schedmd-slurm-gcp-v6-controller
+  - id: slurm_controller
+    source: community/modules/scheduler/schedmd-slurm-gcp-v6-controller
+    use:
+    - network
+    - homefs    
+    - appfs    
+    - data-bucket
+    #- spack-setup    # use via source /software/spack/share/spack/setup-env.sh  && spack install intel-oneapi-mpi@2021.11.0
+    - static_partition
+    - slurm_login
+    settings:
+      machine_type: $(vars.slurm_login_controller_machine_type)
+      enable_controller_public_ips: false
+      disk_type: hyperdisk-balanced
+      #controller_startup_scripts_timeout: 1200
